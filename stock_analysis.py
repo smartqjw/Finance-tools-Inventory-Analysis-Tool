@@ -67,7 +67,7 @@ class StockAnalysisApp:
             ("耗用", lambda: self.filter_by_type("out")),
             ("结存", lambda: self.filter_by_type("ending")),
             ("excel", self.export_reconciliation),
-            ("word", self.export_word_report),
+            ("word", self.export_word_report_v2),
             ("目录", self.open_export_folder)
         ]
         
@@ -1049,7 +1049,371 @@ class StockAnalysisApp:
             messagebox.showinfo("成功", f"Word报告已导出到:\n{export_file}")
             
         except Exception as e:
-            messagebox.showerror("错误", f"导出失败: {str(e)}")
+            messagebox.showerror("错误", f"导出失败：{str(e)}")
+            self.status_label.config(text="导出失败", fg="red")
+    
+    def export_word_report_v2(self):
+        if self.df is None:
+            messagebox.showwarning("警告", "请先读取 Excel 文件")
+            return
+        
+        try:
+            self.status_label.config(text="正在导出 Word 报告...", fg="orange")
+            self.root.update()
+            
+            df = self.filtered_df if self.filtered_df is not None else self.df
+            
+            # 创建 Word 文档
+            doc = Document()
+            
+            # 添加标题
+            title = doc.add_heading('Monthly Inventory Movement Analysis', 0)
+            title.alignment = 1  # 居中
+            
+            # 获取用户选择的 site 名称
+            selected_locations = [loc for loc, var in self.location_vars.items() if var.get()]
+            site_name = "_&".join(selected_locations) if selected_locations else "all"
+            
+            # 添加称呼
+            doc.add_paragraph()
+            para = doc.add_paragraph()
+            run = para.add_run(f'Dear {site_name} Site Head,')
+            run.bold = True
+            
+            doc.add_paragraph()
+            doc.add_paragraph('Please find below the monthly inventory movement analysis for your review.')
+            
+            # 识别列
+            opening_cols = [col for col in df.columns if "opening" in str(col).lower() or "期初" in str(col)]
+            in_cols = [col for col in df.columns if ("in" in str(col).lower() or "入库" in str(col)) and not ("opening" in str(col).lower() or "期初" in str(col) or "ending" in str(col).lower() or "期末" in str(col))]
+            out_cols = [col for col in df.columns if "out" in str(col).lower() or "出库" in str(col)]
+            ending_cols = [col for col in df.columns if "ending" in str(col).lower() or "期末" in str(col)]
+            
+            category_col = None
+            for col in df.columns:
+                col_str = str(col)
+                if "类别" in col_str or "category" in col_str.lower():
+                    category_col = col
+                    break
+            
+            # 1. Summary 部分
+            doc.add_paragraph()
+            para = doc.add_paragraph()
+            run = para.add_run('●   Summary')
+            run.bold = True
+            
+            # 按类别汇总表格
+            if category_col:
+                categories = sorted(df[category_col].unique())
+                
+                # 准备汇总数据
+                summary_data = []
+                for category in categories:
+                    category_df = df[df[category_col] == category]
+                    
+                    opening_amount = 0
+                    if opening_cols:
+                        numeric_df = category_df[opening_cols].apply(pd.to_numeric, errors='coerce')
+                        opening_amount = numeric_df.sum().sum()
+                    
+                    in_amount = 0
+                    if in_cols:
+                        numeric_df = category_df[in_cols].apply(pd.to_numeric, errors='coerce')
+                        in_amount = numeric_df.sum().sum()
+                    
+                    out_amount = 0
+                    if out_cols:
+                        numeric_df = category_df[out_cols].apply(pd.to_numeric, errors='coerce')
+                        out_amount = numeric_df.sum().sum()
+                    
+                    ending_amount = 0
+                    if ending_cols:
+                        numeric_df = category_df[ending_cols].apply(pd.to_numeric, errors='coerce')
+                        ending_amount = numeric_df.sum().sum()
+                    
+                    summary_data.append({
+                        'category': category,
+                        'opening': opening_amount,
+                        'in': in_amount,
+                        'out': out_amount,
+                        'ending': ending_amount
+                    })
+                
+                # 添加合计行
+                total_opening = sum(item['opening'] for item in summary_data)
+                total_in = sum(item['in'] for item in summary_data)
+                total_out = sum(item['out'] for item in summary_data)
+                total_ending = sum(item['ending'] for item in summary_data)
+                summary_data.append({
+                    'category': 'Total',
+                    'opening': total_opening,
+                    'in': total_in,
+                    'out': total_out,
+                    'ending': total_ending
+                })
+                
+                # 创建表格 - 使用英文固定表头
+                table = doc.add_table(rows=1, cols=5)
+                table.style = 'Table Grid'
+                hdr_cells = table.rows[0].cells
+                headers = ['Category', 'Opening', 'Purchase', 'Consumption', 'Ending']
+                for i, header in enumerate(headers):
+                    hdr_cells[i].text = header
+                    hdr_cells[i].paragraphs[0].runs[0].bold = True
+                
+                # 设置列宽：第一列 50%，其余列平均分配剩余 50%
+                table.columns[0].width = Inches(3.0)  # 第一列占 50%
+                for i in range(1, 5):
+                    table.columns[i].width = Inches(0.75)  # 其余列各占约 12.5%
+                
+                for item in summary_data:
+                    row_cells = table.add_row().cells
+                    row_cells[0].text = str(item['category'])
+                    row_cells[1].text = f"{item['opening']:,.2f}"
+                    row_cells[2].text = f"{item['in']:,.2f}"
+                    row_cells[3].text = f"{item['out']:,.2f}"
+                    row_cells[4].text = f"{item['ending']:,.2f}"
+            
+            # 2. Inventory Receipt Analysis 部分
+            doc.add_paragraph()
+            para = doc.add_paragraph()
+            run = para.add_run('●   Inventory Receipt Analysis')
+            run.bold = True
+            
+            # 计算当月入库金额和数量
+            total_receipt_amount = 0
+            total_receipt_qty = 0
+            
+            if in_cols:
+                numeric_df = df[in_cols].apply(pd.to_numeric, errors='coerce')
+                total_receipt_amount = numeric_df.sum().sum()
+                qty_cols = [col for col in in_cols if "数量" in str(col) or "qty" in str(col).lower()]
+                if qty_cols:
+                    numeric_qty_df = df[qty_cols].apply(pd.to_numeric, errors='coerce')
+                    total_receipt_qty = numeric_qty_df.sum().sum()
+                else:
+                    total_receipt_qty = len(df[df[in_cols[0]] != 0])
+            
+            doc.add_paragraph()
+            para = doc.add_paragraph()
+            run = para.add_run('Total inventory receipt amount for the month: ')
+            run = para.add_run(f'${total_receipt_amount:,.2f}')
+            run.bold = True
+            run = para.add_run(', this covers a total of ')
+            run = para.add_run(f'{total_receipt_qty:,.0f}')
+            run.bold = True
+            run = para.add_run(' items, with the top 5 items by value as follows:')
+            
+            # 获取前 5 个入库物品
+            product_col = None
+            for col in df.columns:
+                col_str = str(col)
+                if "产品" in col_str or "product" in col_str.lower():
+                    product_col = col
+                    break
+            
+            if product_col and in_cols:
+                in_cols_no_qty = [col for col in in_cols if not ("数量" in str(col) or "qty" in str(col).lower())]
+                qty_cols_in = [col for col in in_cols if "数量" in str(col) or "qty" in str(col).lower()]
+                if in_cols_no_qty:
+                    df_with_products = df.copy()
+                    df_with_products['total_in'] = df_with_products[in_cols_no_qty].apply(pd.to_numeric, errors='coerce').sum(axis=1)
+                    # 选择产品列、金额列和数量列
+                    select_cols = [product_col] + in_cols_no_qty + qty_cols_in
+                    top5_in = df_with_products.nlargest(5, 'total_in')[select_cols]
+                    
+                    # 使用实际列名创建表格（产品 + 金额列 + 数量列），不显示 Category
+                    table_cols = [product_col] + in_cols_no_qty + qty_cols_in
+                    table = doc.add_table(rows=1, cols=len(table_cols))
+                    table.style = 'Table Grid'
+                    hdr_cells = table.rows[0].cells
+                    for i, col in enumerate(table_cols):
+                        hdr_cells[i].text = str(col)
+                        hdr_cells[i].paragraphs[0].runs[0].bold = True
+                    
+                    # 设置列宽：第一列 50%，其余列平均分配剩余 50%
+                    table.columns[0].width = Inches(3.0)  # 第一列占 50%
+                    remaining_cols = len(table_cols) - 1
+                    if remaining_cols > 0:
+                        for i in range(1, len(table_cols)):
+                            table.columns[i].width = Inches(3.0 / remaining_cols)  # 平均分配剩余宽度
+                    
+                    for _, row in top5_in.iterrows():
+                        row_cells = table.add_row().cells
+                        for i, col in enumerate(table_cols):
+                            if col in row:
+                                row_cells[i].text = f"{row[col]:,.2f}" if isinstance(row[col], (int, float)) else str(row[col])
+                            else:
+                                row_cells[i].text = 'N/A'
+            
+            # 3. Inventory Consumption Analysis 部分
+            doc.add_paragraph()
+            para = doc.add_paragraph()
+            run = para.add_run('●   Inventory Consumption Analysis')
+            run.bold = True
+            
+            total_consumption_amount = 0
+            total_consumption_qty = 0
+            
+            if out_cols:
+                numeric_df = df[out_cols].apply(pd.to_numeric, errors='coerce')
+                total_consumption_amount = numeric_df.sum().sum()
+                qty_cols = [col for col in out_cols if "数量" in str(col) or "qty" in str(col).lower()]
+                if qty_cols:
+                    numeric_qty_df = df[qty_cols].apply(pd.to_numeric, errors='coerce')
+                    total_consumption_qty = numeric_qty_df.sum().sum()
+                else:
+                    total_consumption_qty = len(df[df[out_cols[0]] != 0])
+            
+            doc.add_paragraph()
+            para = doc.add_paragraph()
+            run = para.add_run('Total consumption amount for the month: ')
+            run = para.add_run(f'${total_consumption_amount:,.2f}')
+            run.bold = True
+            run = para.add_run(', this covers a total of ')
+            run = para.add_run(f'{total_consumption_qty:,.0f}')
+            run.bold = True
+            run = para.add_run(' items, with the top 5 items by consumption value as follows:')
+            
+            if product_col and out_cols:
+                out_cols_no_qty = [col for col in out_cols if not ("数量" in str(col) or "qty" in str(col).lower())]
+                qty_cols_out = [col for col in out_cols if "数量" in str(col) or "qty" in str(col).lower()]
+                if out_cols_no_qty:
+                    df_with_products = df.copy()
+                    df_with_products['total_out'] = df_with_products[out_cols_no_qty].apply(pd.to_numeric, errors='coerce').sum(axis=1)
+                    # 选择产品列、金额列和数量列
+                    select_cols = [product_col] + out_cols_no_qty + qty_cols_out
+                    top5_out = df_with_products.nlargest(5, 'total_out')[select_cols]
+                    
+                    # 使用实际列名创建表格（产品 + 金额列 + 数量列），不显示 Category
+                    table_cols = [product_col] + out_cols_no_qty + qty_cols_out
+                    table = doc.add_table(rows=1, cols=len(table_cols))
+                    table.style = 'Table Grid'
+                    hdr_cells = table.rows[0].cells
+                    for i, col in enumerate(table_cols):
+                        hdr_cells[i].text = str(col)
+                        hdr_cells[i].paragraphs[0].runs[0].bold = True
+                    
+                    # 设置列宽：第一列 50%，其余列平均分配剩余 50%
+                    table.columns[0].width = Inches(3.0)  # 第一列占 50%
+                    remaining_cols = len(table_cols) - 1
+                    if remaining_cols > 0:
+                        for i in range(1, len(table_cols)):
+                            table.columns[i].width = Inches(3.0 / remaining_cols)  # 平均分配剩余宽度
+                    
+                    for _, row in top5_out.iterrows():
+                        row_cells = table.add_row().cells
+                        for i, col in enumerate(table_cols):
+                            if col in row:
+                                row_cells[i].text = f"{row[col]:,.2f}" if isinstance(row[col], (int, float)) else str(row[col])
+                            else:
+                                row_cells[i].text = 'N/A'
+            
+            # 4. Month-End Inventory Balance 部分
+            doc.add_paragraph()
+            para = doc.add_paragraph()
+            run = para.add_run('●   Month-End Inventory Balance')
+            run.bold = True
+            
+            total_ending_amount = 0
+            total_ending_qty = 0
+            
+            if ending_cols:
+                numeric_df = df[ending_cols].apply(pd.to_numeric, errors='coerce')
+                total_ending_amount = numeric_df.sum().sum()
+                qty_cols = [col for col in ending_cols if "数量" in str(col) or "qty" in str(col).lower()]
+                if qty_cols:
+                    numeric_qty_df = df[qty_cols].apply(pd.to_numeric, errors='coerce')
+                    total_ending_qty = numeric_qty_df.sum().sum()
+                else:
+                    total_ending_qty = len(df[df[ending_cols[0]] != 0])
+            
+            doc.add_paragraph()
+            para = doc.add_paragraph()
+            run = para.add_run(f'As of the end of the month, the total inventory value at {site_name} Site is   ')
+            run = para.add_run(f'${total_ending_amount:,.2f}')
+            run.bold = True
+            run = para.add_run(' , covering   ')
+            run = para.add_run(f'{total_ending_qty:,.0f}')
+            run.bold = True
+            run = para.add_run(' items.')
+            
+            doc.add_paragraph()
+            para = doc.add_paragraph()
+            run = para.add_run('The top 5 items by ending balance value are as follows:')
+            
+            if product_col and ending_cols:
+                ending_cols_no_qty = [col for col in ending_cols if not ("数量" in str(col) or "qty" in str(col).lower())]
+                qty_cols_ending = [col for col in ending_cols if "数量" in str(col) or "qty" in str(col).lower()]
+                if ending_cols_no_qty:
+                    df_with_products = df.copy()
+                    df_with_products['total_ending'] = df_with_products[ending_cols_no_qty].apply(pd.to_numeric, errors='coerce').sum(axis=1)
+                    # 选择产品列、金额列和数量列
+                    select_cols = [product_col] + ending_cols_no_qty + qty_cols_ending
+                    top5_ending = df_with_products.nlargest(5, 'total_ending')[select_cols]
+                    
+                    # 使用实际列名创建表格（产品 + 金额列 + 数量列），不显示 Category
+                    table_cols = [product_col] + ending_cols_no_qty + qty_cols_ending
+                    table = doc.add_table(rows=1, cols=len(table_cols))
+                    table.style = 'Table Grid'
+                    hdr_cells = table.rows[0].cells
+                    for i, col in enumerate(table_cols):
+                        hdr_cells[i].text = str(col)
+                        hdr_cells[i].paragraphs[0].runs[0].bold = True
+                    
+                    # 设置列宽：第一列 50%，其余列平均分配剩余 50%
+                    table.columns[0].width = Inches(3.0)  # 第一列占 50%
+                    remaining_cols = len(table_cols) - 1
+                    if remaining_cols > 0:
+                        for i in range(1, len(table_cols)):
+                            table.columns[i].width = Inches(3.0 / remaining_cols)  # 平均分配剩余宽度
+                    
+                    for _, row in top5_ending.iterrows():
+                        row_cells = table.add_row().cells
+                        for i, col in enumerate(table_cols):
+                            if col in row:
+                                row_cells[i].text = f"{row[col]:,.2f}" if isinstance(row[col], (int, float)) else str(row[col])
+                            else:
+                                row_cells[i].text = 'N/A'
+            
+            # 5. Please kindly confirm that 部分
+            doc.add_paragraph()
+            para = doc.add_paragraph()
+            run = para.add_run('Please kindly confirm that:')
+            run.bold = True
+            
+            confirm_items = [
+                'All procurement receipts have been recorded accurately.',
+                'All consumption transactions have been properly registered.',
+                'The month-end inventory quantities are consistent with inventory counts.'
+            ]
+            
+            for item in confirm_items:
+                doc.add_paragraph(item, style='List Bullet')
+            
+            # 保存 Word 文档
+            export_dir = os.path.join(os.path.dirname(self.file_path), "导出") if self.file_path else os.path.join(os.getcwd(), "导出")
+            if not os.path.exists(export_dir):
+                os.makedirs(export_dir)
+            
+            for file in os.listdir(export_dir):
+                if file.endswith(".docx") and "-stock-report_" in file:
+                    file_path = os.path.join(export_dir, file)
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+            
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_file = os.path.join(export_dir, f"{site_name}-stock-report_{timestamp}.docx")
+            
+            doc.save(export_file)
+            
+            self.status_label.config(text="Word 报告导出完成", fg="green")
+            messagebox.showinfo("成功", f"Word 报告已导出到:\n{export_file}")
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败：{str(e)}")
             self.status_label.config(text="导出失败", fg="red")
     
     def show_overview(self):
